@@ -3,11 +3,8 @@
 package test
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -15,182 +12,136 @@ import (
 	"github.com/ragaskar/butcherie"
 )
 
-// startServer starts a butcherie server for integration testing and returns it
+// startBrowser starts a Butcherie instance for integration testing and returns it
 // plus a cleanup function. Tests are skipped if geckodriver is not available.
-func startServer(t *testing.T) (*butcherie.Server, func()) {
+func startBrowser(t *testing.T) (*butcherie.Butcherie, func()) {
 	t.Helper()
 	cfg := butcherie.Config{
 		Profile: fmt.Sprintf("integration-test-%d", time.Now().UnixNano()),
 		Port:    0,
 	}
-	srv := butcherie.New(cfg)
+	b := butcherie.New(cfg)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	if err := srv.Start(ctx); err != nil {
-		cancel()
-		t.Skipf("skipping integration test: Start failed: %v", err)
+	defer cancel()
+	if err := b.StartBrowser(ctx); err != nil {
+		t.Skipf("skipping integration test: StartBrowser failed: %v", err)
 	}
-	cancel()
 
-	return srv, func() { _ = srv.Shutdown() }
+	return b, func() { _ = b.StopBrowser() }
 }
 
-func post(t *testing.T, url string, body interface{}) *http.Response {
-	t.Helper()
-	data, err := json.Marshal(body)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	resp, err := http.Post(url, "application/json", bytes.NewReader(data))
-	if err != nil {
-		t.Fatalf("POST %s: %v", url, err)
-	}
-	return resp
-}
-
-func decodePageResponse(t *testing.T, resp *http.Response) butcherie.PageResponse {
-	t.Helper()
-	defer resp.Body.Close()
-	var pr butcherie.PageResponse
-	if err := json.NewDecoder(resp.Body).Decode(&pr); err != nil {
-		t.Fatalf("decode PageResponse: %v", err)
-	}
-	return pr
-}
-
-func TestServerStartup(t *testing.T) {
-	srv, cleanup := startServer(t)
+func TestBrowserStartup(t *testing.T) {
+	_, cleanup := startBrowser(t)
 	defer cleanup()
-
-	st := srv.Status()
-	if st.Status != butcherie.StatusReady {
-		t.Errorf("status = %q, want %q", st.Status, butcherie.StatusReady)
-	}
-	if srv.URI() == "" {
-		t.Error("URI() is empty after Start")
-	}
+	// startBrowser blocks until ready; if we get here, startup succeeded.
 }
 
 func TestNavigate(t *testing.T) {
-	srv, cleanup := startServer(t)
+	b, cleanup := startBrowser(t)
 	defer cleanup()
 
-	resp := post(t, srv.URI()+"/navigate", map[string]interface{}{
-		"url":            "https://example.com",
-		"skip_load_wait": true,
-	})
-	pr := decodePageResponse(t, resp)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("HTTP status = %d, want 200; errors: %v", resp.StatusCode, pr.Errors)
+	resp, err := b.Navigate(ctx, "https://example.com", butcherie.LoadOptions{SkipLoadWait: true})
+	if err != nil {
+		t.Fatalf("Navigate: %v", err)
 	}
-	if !strings.Contains(pr.HTML, "Example Domain") {
-		t.Errorf("expected 'Example Domain' in HTML, got %d bytes", len(pr.HTML))
+	if !strings.Contains(resp.HTML, "Example Domain") {
+		t.Errorf("expected 'Example Domain' in HTML, got %d bytes", len(resp.HTML))
 	}
-	if pr.StatusCode == 0 {
+	if resp.StatusCode == 0 {
 		t.Error("page status_code is 0")
 	}
 }
 
 func TestCurrentPageSource(t *testing.T) {
-	srv, cleanup := startServer(t)
+	b, cleanup := startBrowser(t)
 	defer cleanup()
 
-	post(t, srv.URI()+"/navigate", map[string]interface{}{
-		"url":            "https://example.com",
-		"skip_load_wait": true,
-	})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 
-	resp, err := http.Get(srv.URI() + "/current_page/source")
-	if err != nil {
-		t.Fatalf("GET /current_page/source: %v", err)
+	if _, err := b.Navigate(ctx, "https://example.com", butcherie.LoadOptions{SkipLoadWait: true}); err != nil {
+		t.Fatalf("Navigate: %v", err)
 	}
-	pr := decodePageResponse(t, resp)
 
-	if !strings.Contains(pr.HTML, "Example Domain") {
+	resp, err := b.Source()
+	if err != nil {
+		t.Fatalf("Source: %v", err)
+	}
+	if !strings.Contains(resp.HTML, "Example Domain") {
 		t.Error("source does not contain expected content")
 	}
 }
 
 func TestClick(t *testing.T) {
-	srv, cleanup := startServer(t)
+	b, cleanup := startBrowser(t)
 	defer cleanup()
 
-	// Navigate to a page with a known link.
-	post(t, srv.URI()+"/navigate", map[string]interface{}{
-		"url":            "https://example.com",
-		"skip_load_wait": true,
-	})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 
-	resp := post(t, srv.URI()+"/current_page/click", map[string]interface{}{
-		"by":             "link_text",
-		"value":          "More information...",
-		"skip_load_wait": true,
-	})
-	pr := decodePageResponse(t, resp)
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("HTTP status = %d; errors: %v", resp.StatusCode, pr.Errors)
+	if _, err := b.Navigate(ctx, "https://example.com", butcherie.LoadOptions{SkipLoadWait: true}); err != nil {
+		t.Fatalf("Navigate: %v", err)
 	}
-	if pr.HTML == "" {
+
+	resp, err := b.Click(ctx, "link_text", "More information...", butcherie.LoadOptions{SkipLoadWait: true})
+	if err != nil {
+		t.Fatalf("Click: %v", err)
+	}
+	if resp.HTML == "" {
 		t.Error("expected HTML after click, got empty string")
 	}
 }
 
 func TestShutdown(t *testing.T) {
-	srv, _ := startServer(t)
+	b, _ := startBrowser(t)
 
-	resp := post(t, srv.URI()+"/shutdown", map[string]interface{}{})
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("shutdown status = %d, want 200", resp.StatusCode)
-	}
-	var body map[string]string
-	json.NewDecoder(resp.Body).Decode(&body)
-	resp.Body.Close()
-	if body["status"] != "shutting down" {
-		t.Errorf("body = %v", body)
+	if err := b.StopBrowser(); err != nil {
+		t.Errorf("StopBrowser: %v", err)
 	}
 
-	// Give server time to shut down, then verify it no longer accepts connections.
-	time.Sleep(1 * time.Second)
-	_, err := http.Get(srv.URI() + "/status")
+	// Subsequent Navigate should fail.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := b.Navigate(ctx, "https://example.com", butcherie.LoadOptions{SkipLoadWait: true})
 	if err == nil {
-		t.Error("expected connection failure after shutdown, got nil error")
+		t.Error("expected error after StopBrowser, got nil")
 	}
 }
 
 func TestProfilePersistence(t *testing.T) {
-	srv, cleanup := startServer(t)
+	b, cleanup := startBrowser(t)
 	defer cleanup()
 
-	// Profile dir should exist and contain user.js.
-	cfg := srv.Config()
+	cfg := b.Config()
 	profileDir := cfg.ConfigPath + "/" + cfg.Profile
 
-	// Just confirm the server is running; profile dir existence is verified
-	// by the fact that Start() succeeded (prepareProfile would have failed otherwise).
-	if srv.URI() == "" {
-		t.Error("server URI is empty — Start() did not succeed")
-	}
+	// Profile dir existence is verified by the fact that StartBrowser() succeeded.
 	_ = profileDir
 }
 
 func TestSkipLoadWait(t *testing.T) {
-	srv, cleanup := startServer(t)
+	b, cleanup := startBrowser(t)
 	defer cleanup()
 
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
 	start := time.Now()
-	resp := post(t, srv.URI()+"/navigate", map[string]interface{}{
-		"url":            "https://example.com",
-		"skip_load_wait": true,
-	})
+	resp, err := b.Navigate(ctx, "https://example.com", butcherie.LoadOptions{SkipLoadWait: true})
 	elapsed := time.Since(start)
 
-	pr := decodePageResponse(t, resp)
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("HTTP status = %d; errors: %v", resp.StatusCode, pr.Errors)
+	if err != nil {
+		t.Fatalf("Navigate: %v", err)
+	}
+	if len(resp.Errors) > 0 {
+		t.Errorf("unexpected errors: %v", resp.Errors)
 	}
 	// skip_load_wait should not add the 30s network drain window.
 	if elapsed > 10*time.Second {
-		t.Errorf("skip_load_wait took %v, expected much faster", elapsed)
+		t.Errorf("SkipLoadWait took %v, expected much faster", elapsed)
 	}
 }

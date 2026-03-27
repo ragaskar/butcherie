@@ -1,7 +1,4 @@
-.PHONY: build test
-
-build:
-	mise exec -- go build -o bin/butcherie ./cmd/butcherie
+.PHONY: test
 
 test:
 	mise exec -- go test -v ./...

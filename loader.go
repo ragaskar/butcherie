@@ -15,7 +15,7 @@ const defaultLoadTimeout = 30 * time.Second
 // The context controls the overall deadline. If ctx has no deadline and
 // opts.Timeout is zero, a 30-second timeout is applied automatically.
 // If opts.SkipLoadWait is true the function returns immediately.
-func (s *Server) ensureLoaded(ctx context.Context, opts LoadOptions) error {
+func (b *Butcherie) ensureLoaded(ctx context.Context, opts LoadOptions) error {
 	if opts.SkipLoadWait {
 		return nil
 	}
@@ -44,9 +44,9 @@ func (s *Server) ensureLoaded(ctx context.Context, opts LoadOptions) error {
 
 	// Subscribe to network events before scrolling so we catch any requests
 	// triggered by lazy-load observers.
-	waitIdle := s.cdp.waitForNetworkIdle(ignorePatterns)
+	waitIdle := b.cdp.waitForNetworkIdle(ignorePatterns)
 
-	if err := s.scrollToBottom(ctx); err != nil {
+	if err := b.scrollToBottom(ctx); err != nil {
 		return fmt.Errorf("scroll: %w", err)
 	}
 
@@ -56,7 +56,7 @@ func (s *Server) ensureLoaded(ctx context.Context, opts LoadOptions) error {
 // scrollToBottom scrolls the page one viewport-height at a time until the
 // bottom is reached, pausing 100 ms between steps to allow IntersectionObserver
 // callbacks to fire.
-func (s *Server) scrollToBottom(ctx context.Context) error {
+func (b *Butcherie) scrollToBottom(ctx context.Context) error {
 	script := `
 		window.scrollBy(0, window.innerHeight);
 		return [
@@ -71,7 +71,7 @@ func (s *Server) scrollToBottom(ctx context.Context) error {
 		default:
 		}
 
-		result, err := s.wd.ExecuteScript(script, nil)
+		result, err := b.wd.ExecuteScript(script, nil)
 		if err != nil {
 			return err
 		}

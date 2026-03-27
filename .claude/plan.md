@@ -1,7 +1,6 @@
 # butcherie: Implementation Plan
 
-A local HTTP API server that drives a real Firefox browser via Selenium/geckodriver.
-Provides both an importable Go package and a CLI binary.
+A Go library that drives a real Firefox browser via Selenium/geckodriver.
 
 ---
 
@@ -10,9 +9,18 @@ Provides both an importable Go package and a CLI binary.
 | Concern | Choice | Rationale |
 |---|---|---|
 | WebDriver | `github.com/tebeka/selenium` | geckodriver + W3C WebDriver stack; well-maintained Go bindings |
-| HTTP server | stdlib `net/http` | 5 endpoints; no framework needed |
 | Integration test gating | `//go:build integration` build tag | Standard Go idiom; no runtime env setup needed |
 | Network request tracking | Firefox DevTools Protocol (via geckodriver) | Sees all requests without injection timing risks; no extra dependencies |
+
+---
+
+## Architecture
+
+butcherie is a single library layer:
+
+**Core library** (`butcherie.go`) — implements browser automation directly. Go callers use `Navigate`, `Click`, and `Source` on a `*Butcherie` value. There is no HTTP server and no CLI.
+
+This means a Go application imports `butcherie` and drives Firefox programmatically. Future HTTP or CLI wrappers can be added later if needed, and should be thin shims over this library.
 
 ---
 
@@ -24,22 +32,17 @@ butcherie/
 ├── go.sum
 │
 ├── *.go                            package butcherie  (importable library)
-│   ├── browser.go                  public API: Config, Server, Status types + New/Start/Shutdown
+│   ├── butcherie.go                core library: Config, Butcherie lifecycle + Navigate/Click/Source
 │   ├── driver.go                   WebDriver setup: profile dir, user.js, build_driver
 │   ├── loader.go                   ensureLoaded: incremental scroll + DevTools network drain
-│   ├── server.go                   net/http handlers for all 5 endpoints
+│   ├── cdp.go                      Firefox DevTools Protocol WebSocket client
 │   ├── watcher.go                  goroutine that detects Firefox closure
-│   ├── browser_test.go             unit tests (no build tag)
+│   ├── butcherie_test.go           unit tests for core library (no build tag)
 │   ├── driver_test.go              unit tests (no build tag)
-│   ├── loader_test.go              unit tests (no build tag)
-│   └── server_test.go              unit tests (no build tag)
+│   └── loader_test.go              unit tests (no build tag)
 │
-├── test/
-│   └── browser_integration_test.go //go:build integration — actually launches Firefox
-│
-└── cmd/
-    └── butcherie/
-        └── main.go                 CLI: parse --profile / --port, call butcherie.New().Start()
+└── test/
+    └── browser_integration_test.go //go:build integration — actually launches Firefox
 ```
 
 **Module/package name**: the library is `package butcherie` at the module root,
@@ -50,29 +53,29 @@ so callers import it as `"github.com/ragaskar/butcherie"`.
 ## Public API (package butcherie)
 
 ```go
-// Config holds all options for creating a Server.
+// Config holds all options for creating a Butcherie instance.
 type Config struct {
-    Profile        string        // required: profile name (e.g. "vine-reviews")
-    Port           int           // TCP port; 0 → OS chooses a free port
-    ConfigPath string        // default: ~/.butcherie
+    Profile         string        // required: profile name (e.g. "vine-reviews")
+    Port            int           // TCP port for geckodriver; 0 → OS chooses a free port
+    ConfigPath      string        // default: ~/.butcherie
     PostActionDelay time.Duration // sleep after navigate/click; default 1.5s
 }
 
-// StartupStatus is the lifecycle state of the browser.
-type StartupStatus string
+// Status is the lifecycle state of the browser.
+type Status string
 const (
-    StatusStarting StartupStatus = "starting"
-    StatusReady    StartupStatus = "ready"
-    StatusFailed   StartupStatus = "failed"
+    StatusStarting Status = "starting"
+    StatusReady    Status = "ready"
+    StatusFailed   Status = "failed"
 )
 
-// StatusResponse matches the JSON shape returned by GET /status.
+// StatusResponse is the lifecycle state of the browser.
 type StatusResponse struct {
-    Status StartupStatus `json:"status"`
+    Status Status `json:"status"`
     Errors []string      `json:"errors,omitempty"`
 }
 
-// PageResponse is returned by /navigate, /click, and /current_page/source.
+// PageResponse is returned by Navigate, Click, and Source.
 type PageResponse struct {
     HTML       string              `json:"html"`
     StatusCode int                 `json:"status_code"`
@@ -80,7 +83,7 @@ type PageResponse struct {
     Errors     []string            `json:"errors,omitempty"`
 }
 
-// LoadOptions controls progressive-load waiting behaviour for navigate and click.
+// LoadOptions controls progressive-load waiting behaviour for Navigate and Click.
 type LoadOptions struct {
     // IgnoreRequests is a list of regexes matched against request URIs.
     // In-flight requests whose URI matches any pattern are not waited on.
@@ -92,58 +95,42 @@ type LoadOptions struct {
     Timeout time.Duration `json:"timeout,omitempty"`
 }
 
-// Server is a running butcherie API server.
-type Server struct { /* unexported fields */ }
+// Butcherie drives a real Firefox browser.
+type Butcherie struct { /* unexported fields */ }
 
-// New creates a Server. Does not start Firefox or the HTTP listener yet.
-func New(cfg Config) *Server
+// New creates a Butcherie instance. Does not start Firefox yet.
+func New(cfg Config) *Butcherie
 
-// Start launches the HTTP listener and Firefox, blocking until Firefox is ready
+// Start launches Firefox, blocking until Firefox is ready
 // (or the context is cancelled/times out). The context is the primary mechanism
 // for controlling startup timeout — almost all callers should pass a context
 // with a deadline:
 //
 //   ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 //   defer cancel()
-//   if err := s.Start(ctx); err != nil { ... }
+//   if err := b.Start(ctx); err != nil { ... }
 //
 // Passing context.Background() with no deadline relies on the OS to surface
 // errors (e.g. geckodriver not found) but will block indefinitely if Firefox
 // hangs during startup.
-func (s *Server) Start(ctx context.Context) error
+func (b *Butcherie) StartBrowser(ctx context.Context) error
 
-// Status returns the current startup state without blocking.
-func (s *Server) Status() StatusResponse
+// Navigate navigates Firefox to url, waits for progressive loading to complete,
+// and returns the final page HTML, HTTP status code, and response headers.
+func (b *Butcherie) Navigate(ctx context.Context, url string, opts LoadOptions) (PageResponse, error)
 
-// URI returns the base URL the HTTP server is listening on (e.g. "http://localhost:31331").
-func (s *Server) URI() string
+// Click finds an element using the given strategy and value, clicks it,
+// waits for progressive loading, and returns the resulting page.
+// Supported strategies: link_text, partial_link_text, id, css, xpath, name, class_name, tag_name.
+func (b *Butcherie) Click(ctx context.Context, by, value string, opts LoadOptions) (PageResponse, error)
 
-// Shutdown closes Firefox (with SIGKILL fallback) and stops the HTTP server.
-func (s *Server) Shutdown() error
+// Source returns the current page HTML. StatusCode and Headers are not populated
+// (no navigation is occurring).
+func (b *Butcherie) Source() (PageResponse, error)
+
+// Shutdown closes Firefox (with SIGKILL fallback).
+func (b *Butcherie) StopBrowser() error
 ```
-
----
-
-## HTTP API
-
-| Method | Path | Request body | HTTP status | Response |
-|---|---|---|---|---|
-| `GET` | `/status` | — | 200 | `{"status":"starting\|ready\|failed","errors":[...]}` |
-| `POST` | `/navigate` | `{"url":"...","ignore_requests":[...],"skip_load_wait":false}` | 200 / 400 / 504 | `{"html":"...","status_code":200,"headers":{...},"errors":[...]}` |
-| `POST` | `/current_page/click` | `{"by":"link_text","value":"...","ignore_requests":[...],"skip_load_wait":false}` | 200 / 400 / 504 | `{"html":"...","status_code":200,"headers":{...},"errors":[...]}` |
-| `GET` | `/current_page/source` | — | 200 | `{"html":"...","status_code":200,"headers":{...}}` |
-| `POST` | `/shutdown` | — | 200 | `{"status":"shutting down"}` |
-
-HTTP status codes: 400 = malformed request; 504 = `ensureLoaded` network timeout (body still contains error details).
-
-`ignore_requests`: array of regex strings matched against request URIs — matching
-in-flight requests are not waited on and do not cause a timeout error.
-
-`skip_ensure_all_assets_loaded`: if `true`, skip progressive load waiting entirely (no scroll, no
-network wait).
-
-Click `by` strategies (identical set): `link_text`, `partial_link_text`, `id`,
-`css`, `xpath`, `name`, `class_name`, `tag_name`.
 
 ---
 
@@ -181,50 +168,33 @@ any error means Firefox is gone → call `os.Exit(0)`.
 
 ### Progressive load waiting (`loader.go`)
 
-`ensureLoaded(ctx context.Context, ignoreRequests []string)` is called after every navigate and click (unless skipped). The context carries the deadline — callers should pass a context with a timeout (default 30 s if the incoming HTTP request carries no deadline). Steps:
+`ensureLoaded(ctx context.Context, ignoreRequests []string)` is called after every Navigate and Click (unless skipped). The context carries the deadline — callers should pass a context with a timeout (default 30 s if the incoming context carries no deadline). Steps:
 
 1. **Incremental scroll**: repeatedly execute `window.scrollBy(0, window.innerHeight)` via `wd.ExecuteScript`, pausing briefly between steps, until `window.scrollY + window.innerHeight >= document.body.scrollHeight`.
 2. **Network drain**: via Firefox DevTools Protocol, subscribe to network events (`Network.requestWillBeSent`, `Network.loadingFinished`, `Network.loadingFailed`) to track in-flight requests. Wait until all pending requests complete or `ctx` is done.
    - Requests whose URI matches any regex in `ignoreRequests` are excluded from tracking.
-3. **Timeout error**: if `ctx` expires while non-ignored requests are still pending, return an error containing the request details (target URL, method, POST payload if any). The HTTP handler maps `context.DeadlineExceeded` → 504.
+3. **Timeout error**: if `ctx` expires while non-ignored requests are still pending, return an error containing the request details (target URL, method, POST payload if any).
 
-The `Timeout` field in `LoadOptions` is still accepted for HTTP callers that want an explicit per-request deadline; the handler wraps the request context with `context.WithTimeout` using that value before calling `ensureLoaded`.
+The `Timeout` field in `LoadOptions` is still accepted; Navigate/Click wrap the incoming context with `context.WithTimeout` using that value before calling `ensureLoaded`.
 
 Firefox DevTools Protocol is accessed via geckodriver's WebSocket endpoint: `ws://localhost:<geckoport>/session/<sessionId>/moz/cdp/`.
 
-### Shutdown sequence (`browser.go`)
+### Core library (`butcherie.go`)
+
+`Navigate`, `Click`, and `Source` implement all browser automation logic directly:
+- Acquire the instance mutex (operations are serialised — the browser can only do one thing at a time).
+- Subscribe to CDP document response capture before the action.
+- Call the WebDriver action (`wd.Get`, `elem.Click`).
+- Sleep `PostActionDelay`.
+- Call `ensureLoaded`.
+- Return `PageResponse`.
+
+### Shutdown sequence (`butcherie.go`)
 
 1. Call `wd.Quit()` (closes Firefox via geckodriver).
 2. Poll `os.FindProcess(firefoxPID)` + `process.Signal(syscall.Signal(0))` for
    up to 30 seconds.
 3. If still alive after 30 s, `process.Signal(syscall.SIGKILL)`.
-4. Stop the HTTP server via `http.Server.Shutdown(ctx)`.
-
-### HTTP handlers (`server.go`)
-
-- Use a `sync.RWMutex`-protected `driver` field so handlers are goroutine-safe.
-- JSON encoding/decoding with `encoding/json`.
-- `POST /shutdown` starts a goroutine (0.5 s delay) then shuts down; responds
-  immediately with 200.
-- `/navigate` and `/click` call `ensureLoaded` after the navigation/click action
-  (unless `skip_load_wait` is true), then return `{"html":"...","errors":[...]}`.
-
----
-
-## CLI (`cmd/butcherie/main.go`)
-
-```
-Usage: butcherie --profile <name> [--port 31331]
-
-Flags:
-  --profile  string   Profile name (required)
-  --port     int      Port to listen on (default 31331)
-```
-
-Responsibilities:
-1. Parse flags with `flag` package.
-2. Create a 60-second context and call `butcherie.New(cfg).Start(ctx)`. Print a "waiting for Firefox..." message before blocking.
-3. Block until the process is killed or the server exits.
 
 ---
 
@@ -235,14 +205,13 @@ Responsibilities:
 | File | What is tested |
 |---|---|
 | `driver_test.go` | `writeProfilePrefs` writes correct `user.js` content; `profileDir` expansion |
-| `server_test.go` | Each HTTP handler in isolation, with a mock/stub `WebDriver` interface |
-| `browser_test.go` | `Config` defaults, `Start` context cancellation and timeout |
+| `butcherie_test.go` | `Config` defaults, `StartBrowser` context cancellation/timeout; `Navigate`/`Click`/`Source` with a stub WebDriver |
 | `loader_test.go` | `ensureLoaded`: scroll loop terminates, `ignore_requests` regex filtering, timeout error contains request details, `skip_load_wait` bypasses all behaviour |
 
-**WebDriver interface**: to make handlers testable without geckodriver, extract a
+**WebDriver interface**: to make the library testable without geckodriver, extract a
 `WebDriver` interface (subset of `tebeka/selenium.WebDriver`) covering the
 methods the package calls (`Get`, `PageSource`, `FindElement`, `Title`, `Quit`,
-`Capabilities`).  Production code gets a real `selenium.WebDriver`; unit tests
+`Capabilities`, `ExecuteScript`, `SessionID`).  Production code gets a real `selenium.WebDriver`; unit tests
 get a struct that implements the interface.
 
 ### Integration tests (`//go:build integration`)
@@ -251,16 +220,16 @@ Run with: `go test -tags integration ./test/...`
 
 | Test | What it verifies |
 |---|---|
-| `TestServerStartup` | `New(cfg).Start(ctx)` with 60 s context → status is `ready` |
-| `TestNavigate` | `POST /navigate` returns HTML containing expected content |
-| `TestCurrentPageSource` | `GET /current_page/source` returns same HTML as last navigate |
-| `TestClick` | `POST /current_page/click` with a known link navigates to the linked page |
-| `TestShutdown` | `POST /shutdown` returns 200; subsequent requests fail |
+| `TestBrowserStartup` | `New(cfg).StartBrowser(ctx)` with 60 s context returns nil error |
+| `TestNavigate` | `Navigate` returns HTML containing expected content |
+| `TestCurrentPageSource` | `Source` returns same HTML as last navigate |
+| `TestClick` | `Click` with a known link navigates to the linked page |
+| `TestShutdown` | `StopBrowser` closes Firefox; subsequent `Navigate` calls fail |
 | `TestProfilePersistence` | Profile dir and `user.js` exist after startup |
-| `TestProgressiveLoad` | `POST /navigate` to a lazy-loading page returns HTML with content that only appears after scrolling |
-| `TestNetworkTimeout` | `POST /navigate` with a slow request returns an error with the request URL after timeout |
-| `TestIgnoreRequests` | `POST /navigate` with `ignore_requests` matching a slow request succeeds without waiting for it |
-| `TestSkipLoadWait` | `POST /navigate` with `skip_load_wait: true` returns immediately without scrolling or waiting |
+| `TestProgressiveLoad` | `Navigate` to a lazy-loading page returns HTML with content that only appears after scrolling |
+| `TestNetworkTimeout` | `Navigate` with a slow request returns an error with the request URL after timeout |
+| `TestIgnoreRequests` | `Navigate` with `IgnoreRequests` matching a slow request succeeds without waiting for it |
+| `TestSkipLoadWait` | `Navigate` with `SkipLoadWait: true` returns immediately without scrolling or waiting |
 
 Integration tests require `geckodriver` and Firefox to be on `$PATH` /
 installed.  They launch a real browser.
@@ -272,19 +241,18 @@ installed.  They launch a real browser.
 A `README.md` file should be written covering:
 
 1. **Installation** — `go get`, geckodriver prerequisite.
-2. **Quick start** — minimal working example showing `New` → `Start` → HTTP calls → `Shutdown`.
-3. **Context convention** — every blocking method (`Start`, and indirectly navigate/click via the HTTP layer) accepts a `context.Context`. Callers should *always* pass a context with a deadline:
+2. **Quick start** — minimal working example showing `New` → `Start` → `Navigate`.
+3. **Context convention** — every blocking method (`StartBrowser`, `Navigate`, `Click`) accepts a `context.Context`. Callers should *always* pass a context with a deadline:
    ```go
    ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
    defer cancel()
-   if err := s.Start(ctx); err != nil {
+   if err := b.StartBrowser(ctx); err != nil {
        log.Fatal(err)
    }
    ```
    Passing `context.Background()` without a deadline will block indefinitely if Firefox hangs. This is intentional for callers that manage timeouts externally, but should be a conscious choice.
-4. **Progressive load waiting** — what `ensureLoaded` does, when to use `ignore_requests`, when to use `skip_load_wait`.
+4. **Progressive load waiting** — what `ensureLoaded` does, when to use `IgnoreRequests`, when to use `SkipLoadWait`.
 5. **Profile management** — where profiles are stored (`ConfigPath/Profile`), how to customise the base path.
-6. **CLI usage** — flags, startup output, signal handling.
 
 ---
 
@@ -292,10 +260,8 @@ A `README.md` file should be written covering:
 
 ```
 github.com/tebeka/selenium       v0.9.9 (or latest)
+github.com/gorilla/websocket     v1.5.3 (or latest)
 ```
-
-`tebeka/selenium` also uses `github.com/blang/semver` and
-`github.com/google/go-cmp` internally, but those come in transitively.
 
 ---
 
